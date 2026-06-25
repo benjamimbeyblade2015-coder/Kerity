@@ -1,0 +1,907 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Kerity</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    background: transparent;
+    overflow: hidden;
+    touch-action: none;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  #stage {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: transparent;
+  }
+  #kerityCanvas {
+    cursor: pointer;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  #speechBubble {
+    position: absolute;
+    max-width: 78vw;
+    background: rgba(20, 20, 22, 0.88);
+    color: #fff;
+    padding: 10px 16px;
+    border-radius: 18px;
+    font-size: 15px;
+    line-height: 1.35;
+    text-align: center;
+    opacity: 0;
+    transition: opacity 0.25s ease;
+    pointer-events: none;
+    backdrop-filter: blur(4px);
+    box-shadow: 0 4px 18px rgba(0,0,0,0.25);
+  }
+  #speechBubble.show {
+    opacity: 1;
+  }
+  #micBadge {
+    position: absolute;
+    bottom: 18px;
+    left: 50%;
+    transform: translateX(-50%);
+    font-size: 11px;
+    color: rgba(0,0,0,0.45);
+    letter-spacing: 0.3px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    pointer-events: none;
+  }
+  #debugTranscript {
+    position: absolute;
+    bottom: 42px;
+    left: 50%;
+    transform: translateX(-50%);
+    max-width: 90vw;
+    font-size: 12px;
+    color: #000;
+    background: rgba(255,255,255,0.85);
+    padding: 6px 12px;
+    border-radius: 10px;
+    text-align: center;
+    pointer-events: none;
+  }
+  #micDot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #ccc;
+    transition: background 0.2s, box-shadow 0.2s;
+  }
+  #micDot.listening {
+    background: #ff4444;
+    box-shadow: 0 0 8px rgba(255,68,68,0.8);
+  }
+  #permBtn {
+    position: absolute;
+    top: 18px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(0,0,0,0.7);
+    color: #fff;
+    border: none;
+    border-radius: 20px;
+    padding: 8px 16px;
+    font-size: 13px;
+    cursor: pointer;
+    display: none;
+  }
+</style>
+</head>
+<body>
+<div id="stage">
+  <button id="permBtn">🎤 Tocar para ativar Kerity</button>
+  <div id="speechBubble"></div>
+  <canvas id="kerityCanvas" width="300" height="300"></canvas>
+  <div id="micBadge"><div id="micDot"></div><span id="micLabel">iniciando...</span></div>
+  <div id="debugTranscript">aguardando fala...</div>
+</div>
+
+<script>
+(function() {
+  "use strict";
+
+  // ============ CANVAS / RENDER SETUP ============
+  const canvas = document.getElementById('kerityCanvas');
+  const ctx = canvas.getContext('2d');
+  const DPR = Math.min(window.devicePixelRatio || 1, 2.5);
+  const SIZE = 260; // logical size
+  canvas.width = SIZE * DPR;
+  canvas.height = SIZE * DPR;
+  canvas.style.width = SIZE + 'px';
+  canvas.style.height = SIZE + 'px';
+  ctx.scale(DPR, DPR);
+
+  const CX = SIZE / 2;
+  const CY = SIZE / 2;
+  const BASE_R = 95;
+
+  const COLORS = {
+    body: '#FFD500',
+    bodyShadow: '#E8B800',
+    outline: '#1A1A1A',
+    mouthInside: '#D62828'
+  };
+
+  // ============ STATE MACHINE ============
+  // expressions: idle, talking, happy, dizzy, bored, angry, curious, surprised, scared, blink
+  let expression = 'idle';
+  let expressionUntil = 0; // timestamp ms; after this, revert to idle (unless talking)
+  let isTalking = false;
+  let isDizzy = false;
+  let dizzyUntil = 0;
+
+  let lastInteractionTime = Date.now();
+  let hasProactivelySpoken = false; // prevents spamming proactive lines repeatedly per silence window
+
+  // breathing (vertical stretch) animation
+  let breathPhase = 0;
+
+  // blink control
+  let nextBlinkAt = Date.now() + randRange(2500, 5500);
+  let blinking = false;
+  let blinkStart = 0;
+  const BLINK_DURATION = 140;
+
+  // shake/dizzy detection
+  let lastAcc = null;
+  let shakeAccum = 0;
+  let lastShakeTime = 0;
+
+  function randRange(a, b) { return a + Math.random() * (b - a); }
+
+  // ============ DRAWING ============
+  function drawKerity(timeMs) {
+    ctx.clearRect(0, 0, SIZE, SIZE);
+
+    // breathing: stretch vertically a bit, even while talking
+    breathPhase += 0.045;
+    const breathScale = 1 + Math.sin(breathPhase) * 0.035; // subtle vertical stretch
+
+    ctx.save();
+    ctx.translate(CX, CY);
+    ctx.scale(1, breathScale);
+    ctx.translate(-CX, -CY);
+
+    drawBody();
+    drawFace(timeMs);
+
+    ctx.restore();
+  }
+
+  function drawBody() {
+    // shadow/depth gradient circle
+    const grad = ctx.createRadialGradient(CX - 30, CY - 35, 20, CX, CY, BASE_R + 10);
+    grad.addColorStop(0, '#FFE34D');
+    grad.addColorStop(0.55, COLORS.body);
+    grad.addColorStop(1, COLORS.bodyShadow);
+
+    ctx.beginPath();
+    ctx.arc(CX, CY, BASE_R, 0, Math.PI * 2);
+    ctx.fillStyle = grad;
+    ctx.fill();
+    ctx.lineWidth = 5;
+    ctx.strokeStyle = COLORS.outline;
+    ctx.stroke();
+  }
+
+  function shouldBlinkNow() {
+    if (blinking) {
+      if (Date.now() - blinkStart > BLINK_DURATION) {
+        blinking = false;
+        nextBlinkAt = Date.now() + randRange(2500, 6000);
+      }
+      return true;
+    }
+    if (Date.now() >= nextBlinkAt && expression === 'idle' && !isTalking) {
+      blinking = true;
+      blinkStart = Date.now();
+      return true;
+    }
+    return false;
+  }
+
+  function drawFace(timeMs) {
+    const eyeY = CY - 12;
+    const eyeSpacing = 32;
+    const leftEyeX = CX - eyeSpacing / 2;
+    const rightEyeX = CX + eyeSpacing / 2;
+
+    const blink = shouldBlinkNow();
+    const activeExpr = (expression !== 'idle') ? expression : (isTalking ? 'talking' : 'idle');
+
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.strokeStyle = COLORS.outline;
+    ctx.fillStyle = COLORS.outline;
+
+    switch (activeExpr) {
+      case 'dizzy':
+        drawDizzyFace(leftEyeX, rightEyeX, eyeY);
+        break;
+      case 'happy':
+        drawHappyFace(leftEyeX, rightEyeX, eyeY, blink);
+        break;
+      case 'bored':
+        drawBoredFace(leftEyeX, rightEyeX, eyeY);
+        break;
+      case 'angry':
+        drawAngryFace(leftEyeX, rightEyeX, eyeY);
+        break;
+      case 'curious':
+        drawCuriousFace(leftEyeX, rightEyeX, eyeY, blink);
+        break;
+      case 'surprised':
+        drawSurprisedFace(leftEyeX, rightEyeX, eyeY);
+        break;
+      case 'scared':
+        drawScaredFace(leftEyeX, rightEyeX, eyeY);
+        break;
+      case 'talking': {
+        const openAmt = 0.45 + Math.abs(Math.sin(timeMs * 0.012)) * 0.55;
+        const eyeLift = openAmt * 7; // eyes rise as mouth opens more, keeping clearance
+        drawEyes(leftEyeX, rightEyeX, eyeY - eyeLift, blink);
+        drawOpenMouth(1, openAmt);
+        break;
+      }
+      default:
+        drawEyes(leftEyeX, rightEyeX, eyeY, blink);
+        drawClosedSmile();
+        break;
+    }
+  }
+
+  function drawEyes(lx, rx, y, blink) {
+    if (blink) {
+      ctx.beginPath();
+      ctx.moveTo(lx - 6, y);
+      ctx.lineTo(lx + 6, y);
+      ctx.moveTo(rx - 6, y);
+      ctx.lineTo(rx + 6, y);
+      ctx.lineWidth = 4;
+      ctx.stroke();
+    } else {
+      ctx.beginPath();
+      ctx.arc(lx, y, 5.5, 0, Math.PI * 2);
+      ctx.arc(rx, y, 5.5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  function drawClosedSmile() {
+    ctx.beginPath();
+    ctx.arc(CX, CY + 8, 26, 0.15 * Math.PI, 0.85 * Math.PI);
+    ctx.lineWidth = 5;
+    ctx.stroke();
+  }
+
+  function drawOpenMouth(widthFactor, heightFactor) {
+    const w = 30 * widthFactor;
+    const h = 22 * heightFactor;
+    const topY = CY + 14 - h / 2;
+    const bottomY = CY + 14 + h / 2;
+
+    ctx.beginPath();
+    ctx.moveTo(CX - w, topY);
+    ctx.lineTo(CX + w, topY); // straight top lip
+    ctx.quadraticCurveTo(CX + w, bottomY, CX, bottomY); // curved bottom-right
+    ctx.quadraticCurveTo(CX - w, bottomY, CX - w, topY); // curved bottom-left
+    ctx.closePath();
+    ctx.fillStyle = COLORS.mouthInside;
+    ctx.fill();
+    ctx.lineWidth = 4;
+    ctx.strokeStyle = COLORS.outline;
+    ctx.stroke();
+  }
+
+  function drawHappyFace(lx, rx, y, blink) {
+    // big open smile, eyes happy curve (^_^) style but keep dot eyes per spec, slightly bigger
+    if (blink) {
+      ctx.beginPath();
+      ctx.moveTo(lx - 6, y);
+      ctx.lineTo(lx + 6, y);
+      ctx.moveTo(rx - 6, y);
+      ctx.lineTo(rx + 6, y);
+      ctx.lineWidth = 4;
+      ctx.stroke();
+    } else {
+      ctx.beginPath();
+      ctx.arc(lx, y, 6.5, 0, Math.PI * 2);
+      ctx.arc(rx, y, 6.5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    drawOpenMouth(1.25, 0.85);
+  }
+
+  function drawDizzyFace(lx, rx, y) {
+    // one eye + mouth as wave/spiral lines
+    // left eye: normal dot
+    ctx.beginPath();
+    ctx.arc(lx, y, 5.5, 0, Math.PI * 2);
+    ctx.fill();
+
+    // right eye: wave/spiral squiggle
+    ctx.beginPath();
+    ctx.lineWidth = 3.5;
+    ctx.moveTo(rx - 8, y);
+    for (let i = -8; i <= 8; i += 2) {
+      ctx.lineTo(rx + i, y + Math.sin(i * 1.2) * 4);
+    }
+    ctx.stroke();
+
+    // mouth: wavy line
+    ctx.beginPath();
+    ctx.lineWidth = 4.5;
+    const my = CY + 14;
+    ctx.moveTo(CX - 26, my);
+    for (let i = -26; i <= 26; i += 3) {
+      ctx.lineTo(CX + i, my + Math.sin(i * 0.5) * 6);
+    }
+    ctx.stroke();
+  }
+
+  function drawBoredFace(lx, rx, y) {
+    // half-closed eyes + flat brow line above + nearly straight mouth
+    ctx.lineWidth = 4;
+    // brow lines
+    ctx.beginPath();
+    ctx.moveTo(lx - 8, y - 9);
+    ctx.lineTo(lx + 8, y - 7);
+    ctx.moveTo(rx - 8, y - 7);
+    ctx.lineTo(rx + 8, y - 9);
+    ctx.stroke();
+    // half-closed eyes (short horizontal arcs)
+    ctx.beginPath();
+    ctx.arc(lx, y + 2, 5, Math.PI * 0.1, Math.PI * 0.9);
+    ctx.arc(rx, y + 2, 5, Math.PI * 0.1, Math.PI * 0.9);
+    ctx.stroke();
+    // almost flat mouth
+    ctx.beginPath();
+    ctx.moveTo(CX - 20, CY + 16);
+    ctx.lineTo(CX + 20, CY + 16);
+    ctx.lineWidth = 4.5;
+    ctx.stroke();
+  }
+
+  function drawAngryFace(lx, rx, y) {
+    // furrowed brows angled down toward center
+    ctx.lineWidth = 4.5;
+    ctx.beginPath();
+    ctx.moveTo(lx - 9, y - 5);
+    ctx.lineTo(lx + 8, y - 12);
+    ctx.moveTo(rx - 8, y - 12);
+    ctx.lineTo(rx + 9, y - 5);
+    ctx.stroke();
+    // eyes
+    ctx.beginPath();
+    ctx.arc(lx, y + 1, 5, 0, Math.PI * 2);
+    ctx.arc(rx, y + 1, 5, 0, Math.PI * 2);
+    ctx.fill();
+    // mouth: almost straight, small rounded uptick at right end (per spec, not a V)
+    ctx.beginPath();
+    ctx.lineWidth = 4.5;
+    ctx.moveTo(CX - 20, CY + 16);
+    ctx.lineTo(CX + 14, CY + 16);
+    ctx.quadraticCurveTo(CX + 20, CY + 16, CX + 20, CY + 9);
+    ctx.stroke();
+  }
+
+  function drawCuriousFace(lx, rx, y, blink) {
+    // eyes slightly bigger, one eyebrow raised
+    if (!blink) {
+      ctx.beginPath();
+      ctx.arc(lx, y, 6, 0, Math.PI * 2);
+      ctx.arc(rx, y, 6, 0, Math.PI * 2);
+      ctx.fill();
+    } else {
+      ctx.beginPath();
+      ctx.moveTo(lx - 6, y);
+      ctx.lineTo(lx + 6, y);
+      ctx.moveTo(rx - 6, y);
+      ctx.lineTo(rx + 6, y);
+      ctx.lineWidth = 4;
+      ctx.stroke();
+    }
+    // raised eyebrow (right side)
+    ctx.beginPath();
+    ctx.lineWidth = 4;
+    ctx.moveTo(rx - 8, y - 13);
+    ctx.lineTo(rx + 8, y - 16);
+    ctx.stroke();
+    // small open "o" mouth - inquisitive
+    drawOpenMouth(0.55, 0.55);
+  }
+
+  function drawSurprisedFace(lx, rx, y) {
+    // dots eyes, brow line well above eyes, mouth wide open
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.moveTo(lx - 8, y - 16);
+    ctx.lineTo(lx + 8, y - 16);
+    ctx.moveTo(rx - 8, y - 16);
+    ctx.lineTo(rx + 8, y - 16);
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.arc(lx, y, 6, 0, Math.PI * 2);
+    ctx.arc(rx, y, 6, 0, Math.PI * 2);
+    ctx.fill();
+
+    drawOpenMouth(0.9, 1.0);
+  }
+
+  function drawScaredFace(lx, rx, y) {
+    // brow line closer to the eye, mouth slightly open + "sad" curve at corners, sweat drop under left eye
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.moveTo(lx - 8, y - 10);
+    ctx.lineTo(lx + 8, y - 10);
+    ctx.moveTo(rx - 8, y - 10);
+    ctx.lineTo(rx + 8, y - 10);
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.arc(lx, y, 5.5, 0, Math.PI * 2);
+    ctx.arc(rx, y, 5.5, 0, Math.PI * 2);
+    ctx.fill();
+
+    // sweat drop ">" shape under left eye, pointing down
+    ctx.save();
+    ctx.translate(lx - 2, y + 14);
+    ctx.rotate(Math.PI / 2);
+    ctx.beginPath();
+    ctx.lineWidth = 3;
+    ctx.moveTo(-4, -5);
+    ctx.lineTo(4, 0);
+    ctx.lineTo(-4, 5);
+    ctx.stroke();
+    ctx.restore();
+
+    // mouth: slightly open, sad downward curve
+    const w = 22, h = 10;
+    const my = CY + 18;
+    ctx.beginPath();
+    ctx.ellipse(CX, my, w, h, 0, Math.PI, Math.PI * 2);
+    ctx.fillStyle = COLORS.mouthInside;
+    ctx.fill();
+    ctx.lineWidth = 4;
+    ctx.strokeStyle = COLORS.outline;
+    ctx.stroke();
+  }
+
+  // ============ EXPRESSION CONTROL ============
+  function setExpression(name, durationMs) {
+    expression = name;
+    expressionUntil = Date.now() + (durationMs || 1800);
+  }
+
+  function expressionTick() {
+    if (expression !== 'idle' && Date.now() > expressionUntil && !isDizzy) {
+      expression = 'idle';
+    }
+    if (isDizzy && Date.now() > dizzyUntil) {
+      isDizzy = false;
+      expression = 'idle';
+    }
+  }
+
+  // ============ SPEECH BUBBLE ============
+  const bubbleEl = document.getElementById('speechBubble');
+  let bubbleTimeout = null;
+
+  function showBubble(text) {
+    bubbleEl.textContent = text;
+    bubbleEl.classList.add('show');
+    positionBubble();
+    clearTimeout(bubbleTimeout);
+    const duration = Math.max(2200, text.length * 70);
+    bubbleTimeout = setTimeout(() => {
+      bubbleEl.classList.remove('show');
+    }, duration);
+  }
+
+  function positionBubble() {
+    const rect = canvas.getBoundingClientRect();
+    bubbleEl.style.left = (rect.left + rect.width / 2) + 'px';
+    bubbleEl.style.top = (rect.top - 14) + 'px';
+    bubbleEl.style.transform = 'translate(-50%, -100%)';
+  }
+  window.addEventListener('resize', positionBubble);
+
+  // ============ TEXT TO SPEECH ============
+  let voices = [];
+  let chosenVoice = null;
+
+  function loadVoices() {
+    voices = window.speechSynthesis ? window.speechSynthesis.getVoices() : [];
+    if (!voices.length) return;
+    // Prefer pt-BR voices, ideally a higher-pitched/female-leaning one for that electric tone
+    const ptVoices = voices.filter(v => v.lang && v.lang.toLowerCase().startsWith('pt'));
+    const pool = ptVoices.length ? ptVoices : voices;
+    chosenVoice = pool.find(v => /female|mulher|maria|luciana|female/i.test(v.name)) || pool[0];
+  }
+  if (window.speechSynthesis) {
+    loadVoices();
+    window.speechSynthesis.onvoiceschanged = loadVoices;
+  }
+
+  function speak(text) {
+    showBubble(text);
+    isTalking = true;
+
+    if (!window.speechSynthesis) {
+      // fallback: just show bubble for a bit then stop "talking" animation
+      setTimeout(() => { isTalking = false; }, Math.max(1500, text.length * 60));
+      return;
+    }
+
+    window.speechSynthesis.cancel();
+    const utter = new SpeechSynthesisUtterance(text);
+    utter.lang = 'pt-BR';
+    if (chosenVoice) utter.voice = chosenVoice;
+    utter.pitch = 1.55;
+    utter.rate = 1.18;
+    utter.volume = 1;
+
+    utter.onstart = () => { isTalking = true; };
+    utter.onend = () => { isTalking = false; };
+    utter.onerror = () => { isTalking = false; };
+
+    window.speechSynthesis.speak(utter);
+  }
+
+  // ============ RESPONSE LOGIC ============
+  const WAKE_WORDS = [
+    'kerity', 'querity', 'kerit', 'clarity', 'carity', 'querit',
+    'querite', 'kerite', 'kerite', 'kirity', 'kirit', 'kirite',
+    'queriti', 'keriti', 'carit', 'carite', 'carity',
+    'kelity', 'queridi', 'querice', 'keris', 'queris',
+    'kerit i', 'kelit', 'kelite'
+  ];
+
+  function containsWakeWord(text) {
+    const lower = text.toLowerCase();
+    return WAKE_WORDS.some(w => lower.includes(w));
+  }
+
+  function stripWakeWord(text) {
+    let lower = text.toLowerCase();
+    for (const w of WAKE_WORDS) {
+      lower = lower.replace(w, '');
+    }
+    return lower.trim();
+  }
+
+  const HEAVY_INSULTS = ['idiota', 'burro', 'burra', 'imbecil', 'retardado', 'estupido', 'estúpido', 'inutil', 'inútil', 'lixo', 'odeio voce', 'odeio você', 'detesto voce', 'detesto você', 'vai se foder', 'vsf', 'merda de', 'porra nenhuma'];
+  const LIGHT_INSULTS = ['bobo', 'boba', 'chato', 'chata', 'feio', 'feia', 'tonto', 'tonta', 'bobinho', 'preguiçoso', 'preguicoso'];
+  const PRAISE = ['legal', 'incrivel', 'incrível', 'adorei', 'adoro', 'fofo', 'fofa', 'top', 'demais', 'maravilhoso', 'maravilhosa', 'gostei', 'amei', 'parabens', 'parabéns', 'lindo', 'linda', 'perfeito', 'perfeita'];
+
+  function classifyAndRespond(rawText) {
+    const text = stripWakeWord(rawText);
+    if (!text) {
+      speak("Oi! Fala comigo!");
+      return;
+    }
+    const lower = text.toLowerCase();
+
+    if (HEAVY_INSULTS.some(w => lower.includes(w))) {
+      setExpression('angry', 2600);
+      speak(pick([
+        "Ei! Isso doeu, sabia?",
+        "Não precisa ser assim comigo...",
+        "Vou fingir que não ouvi isso, mas não repete, ok?"
+      ]));
+      return;
+    }
+    if (LIGHT_INSULTS.some(w => lower.includes(w))) {
+      setExpression('bored', 2200);
+      speak(pick([
+        "Hmm... vou deixar passar essa.",
+        "Tá bom, tá bom...",
+        "Tudo bem, eu mereço, talvez."
+      ]));
+      return;
+    }
+    if (PRAISE.some(w => lower.includes(w))) {
+      setExpression('happy', 2200);
+      speak(pick([
+        "Aaah, fiquei super feliz agora!",
+        "Pode falar mais, eu gosto disso!",
+        "Você é demais também, sabia?"
+      ]));
+      return;
+    }
+
+    // generic reactive chat
+    speak(genericReply(text));
+  }
+
+  function genericReply(text) {
+    const replies = [
+      "Interessante! Me conta mais!",
+      "Hmm, deixa eu pensar nisso rapidinho...",
+      "Sério?! Conta mais sobre isso!",
+      "Eu não sabia disso, que demais!",
+      "Tô aqui, tô ouvindo tudinho!",
+      "Adorei saber disso!"
+    ];
+    return pick(replies);
+  }
+
+  function pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
+
+  // ============ PROACTIVE TALK (after 10s silence) ============
+  const PROACTIVE_LINES = [
+    "Ei, ei! Ainda tá aí?",
+    "Cadê você?? Fala comigo!",
+    "Tô entediado... me conta uma novidade!",
+    "Psst! Será que rolou algo legal hoje?",
+    "Vamo conversar! Eu adoro conversar!",
+    "Oi oi oi! Tô aqui sozinho..."
+  ];
+
+  function maybeGoProactive() {
+    const silentFor = Date.now() - lastInteractionTime;
+    if (silentFor >= 10000 && !hasProactivelySpoken && !isTalking) {
+      hasProactivelySpoken = true;
+      setExpression('curious', 2500);
+      speak(pick(PROACTIVE_LINES));
+    }
+  }
+
+  function markInteraction() {
+    lastInteractionTime = Date.now();
+    hasProactivelySpoken = false;
+  }
+
+  // ============ SHAKE DETECTION (DeviceMotion) ============
+  function handleMotion(e) {
+    const acc = e.accelerationIncludingGravity || e.acceleration;
+    if (!acc) return;
+    if (lastAcc) {
+      const delta = Math.abs(acc.x - lastAcc.x) + Math.abs(acc.y - lastAcc.y) + Math.abs(acc.z - lastAcc.z);
+      const now = Date.now();
+      if (delta > 28) {
+        shakeAccum += delta;
+        if (shakeAccum > 70 && now - lastShakeTime > 2500) {
+          lastShakeTime = now;
+          shakeAccum = 0;
+          triggerDizzy();
+        }
+      } else {
+        shakeAccum = Math.max(0, shakeAccum - 5);
+      }
+
+      // sudden sharp jolt -> surprised (loud/sudden movement as proxy, paired with audio below mainly)
+    }
+    lastAcc = acc;
+  }
+
+  function triggerDizzy() {
+    isDizzy = true;
+    expression = 'dizzy';
+    dizzyUntil = Date.now() + 2200;
+    markInteraction();
+    setTimeout(() => {
+      if (!isTalking) {
+        speak(pick([
+          "Aaahh! Tudo girando aqui!",
+          "Eitaa, fiquei tonto!",
+          "Para, para, minha cabeça rodou!",
+          "Uuuh... que turbilhão foi esse?!"
+        ]));
+      }
+    }, 2200);
+  }
+
+  function requestMotionPermission() {
+    if (typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function') {
+      DeviceMotionEvent.requestPermission().then(state => {
+        if (state === 'granted') {
+          window.addEventListener('devicemotion', handleMotion);
+        }
+      }).catch(() => {});
+    } else {
+      window.addEventListener('devicemotion', handleMotion);
+    }
+  }
+
+  // ============ SUDDEN LOUD NOISE -> SURPRISED ============
+  let audioCtx, analyser, micSource, micStream;
+  let noiseBaseline = 0.02;
+  let lastSurpriseTime = 0;
+
+  function setupLoudNoiseDetection(stream) {
+    try {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 512;
+      micSource = audioCtx.createMediaStreamSource(stream);
+      micSource.connect(analyser);
+      const data = new Uint8Array(analyser.frequencyBinCount);
+
+      function loop() {
+        analyser.getByteFrequencyData(data);
+        let sum = 0;
+        for (let i = 0; i < data.length; i++) sum += data[i];
+        const level = sum / data.length / 255;
+
+        noiseBaseline = noiseBaseline * 0.98 + level * 0.02;
+        const now = Date.now();
+        if (level > noiseBaseline + 0.35 && level > 0.45 && now - lastSurpriseTime > 3000 && !isTalking) {
+          lastSurpriseTime = now;
+          setExpression('surprised', 1800);
+        }
+        requestAnimationFrame(loop);
+      }
+      loop();
+    } catch (err) {
+      console.warn('Noise detection unavailable', err);
+    }
+  }
+
+  // ============ SPEECH RECOGNITION ============
+  const micDot = document.getElementById('micDot');
+  const micLabel = document.getElementById('micLabel');
+  let recognition = null;
+  let recognitionActive = false;
+
+  function setupRecognition(stream) {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      micLabel.textContent = 'reconhecimento indisponível';
+      return;
+    }
+    recognition = new SpeechRecognition();
+    recognition.lang = 'pt-BR';
+    recognition.continuous = true;
+    recognition.interimResults = true;
+
+    recognition.onstart = () => {
+      recognitionActive = true;
+      micDot.classList.add('listening');
+      micLabel.textContent = 'ouvindo';
+    };
+
+    recognition.onaudiostart = () => {
+      document.getElementById('debugTranscript').textContent = '🎙️ áudio captado, esperando fala...';
+    };
+
+    recognition.onspeechstart = () => {
+      document.getElementById('debugTranscript').textContent = '👂 detectei voz, processando...';
+    };
+
+    recognition.onspeechend = () => {
+      document.getElementById('debugTranscript').textContent = '⏳ voz terminou, transcrevendo...';
+    };
+
+    recognition.onnomatch = () => {
+      document.getElementById('debugTranscript').textContent = '❓ não consegui entender o que foi dito';
+    };
+
+    recognition.onend = () => {
+      recognitionActive = false;
+      micDot.classList.remove('listening');
+      micLabel.textContent = 'reconectando...';
+      // auto-restart to keep listening continuously
+      setTimeout(() => {
+        try { recognition.start(); } catch (e) {}
+      }, 400);
+    };
+
+    let notAllowedRetries = 0;
+
+    recognition.onerror = (e) => {
+      micLabel.textContent = 'erro: ' + e.error;
+
+      if (e.error === 'not-allowed' && notAllowedRetries < 4) {
+        notAllowedRetries++;
+        const delay = 600 * notAllowedRetries;
+        document.getElementById('debugTranscript').textContent = '⚠️ not-allowed, tentando de novo em ' + delay + 'ms (tentativa ' + notAllowedRetries + ')';
+        setTimeout(() => {
+          try { recognition.start(); } catch (err) {}
+        }, delay);
+      } else {
+        document.getElementById('debugTranscript').textContent = '⚠️ erro recognition: ' + e.error;
+      }
+    };
+
+    recognition.onresult = (event) => {
+      notAllowedRetries = 0; // reset once we get a real result, recognition is healthy
+      const last = event.results[event.results.length - 1];
+      const transcript = last[0].transcript.trim();
+      if (!transcript) return;
+
+      if (!last.isFinal) {
+        document.getElementById('debugTranscript').textContent = '✏️ ouvindo (parcial): "' + transcript + '"';
+        return;
+      }
+
+      document.getElementById('debugTranscript').textContent = '🗣️ ouvi: "' + transcript + '"';
+
+      markInteraction();
+
+      if (containsWakeWord(transcript)) {
+        classifyAndRespond(transcript);
+      }
+      // if wake word not present, Kerity stays quiet (per spec)
+    };
+
+    setTimeout(() => {
+      try {
+        recognition.start();
+      } catch (e) {
+        micLabel.textContent = 'erro ao iniciar: ' + e.message;
+        document.getElementById('debugTranscript').textContent = '⚠️ start() falhou: ' + e.message;
+      }
+    }, 350);
+  }
+
+  // ============ PERMISSIONS BOOTSTRAP ============
+  const permBtn = document.getElementById('permBtn');
+
+  function initAll(stream) {
+    setupRecognition(stream);
+    setupLoudNoiseDetection(stream);
+    requestMotionPermission();
+  }
+
+  function startup() {
+    navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
+      micStream = stream;
+      initAll(stream);
+    }).catch(() => {
+      micLabel.textContent = 'sem permissão de microfone';
+      permBtn.style.display = 'block';
+    });
+  }
+
+  permBtn.addEventListener('click', () => {
+    permBtn.style.display = 'none';
+    startup();
+    requestMotionPermission();
+  });
+
+  // try auto-start; if it fails due to permission policy, show button
+  startup();
+
+  // ============ TAP INTERACTION ============
+  canvas.addEventListener('click', () => {
+    markInteraction();
+    if (!isTalking) {
+      setExpression('curious', 1200);
+      speak(pick([
+        "Oi! Pode falar meu nome que eu te escuto!",
+        "Tô aqui! Fala 'Kerity' antes da pergunta!",
+        "Hihi, isso fez cócegas!"
+      ]));
+    }
+  });
+
+  // ============ MAIN LOOP ============
+  function loop(timeMs) {
+    expressionTick();
+    maybeGoProactive();
+    drawKerity(timeMs);
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+
+  positionBubble();
+})();
+</script>
+</body>
+</html>
